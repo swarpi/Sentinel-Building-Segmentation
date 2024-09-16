@@ -1,0 +1,126 @@
+1. Data Acquisition and Preparation
+To construct the training data for building segmentation, the pipeline addresses two
+primary tasks: downloading OpenStreetMap (OSM) files and obtaining satellite images
+from Sentinel-2. The process starts with using the download_sentinel_band function,
+which downloads the sentinel files from "https://openeocloud.vito.be/openeo/1.0.0".
+Two Sentinel-2 files are downloaded: one containing a single band ("B04") and another
+with multiple bands ("B04", "B03", "B02", "B08"). This separation was necessary because
+plotting a single band image directly from the multi-band data was not possible.
+The reproject_sentinel_to_utm function then reprojects the Sentinel-2 images to the
+UTM (Universal Transverse Mercator) coordinate system, ensuring alignment with the
+OSM data. It was also necessary to look up the specific utm zone for each city.
+For OSM data, the process_osm_data function manages the retrieval and processing. It
+involves downloading OSM files for the cities, extracting the building data, and
+reprojecting it to match the Sentinel-2 CRS. The resulting data is then plotted and saved
+as high-definition JPEG images. This was neccesary for creatig the patches in the next
+steps, as creating patches and tensor from geoJson file or osm.pbf files have proven to
+be difficult.
+RGB Bands OSM
+Overlay of RGB and OSM Single Band
+IRB Bands
+1.2 Data Preparation
+This task has proven to be the most challenging due to the differing tensor shapes,
+particularly the target labels. The primary difficulty was splitting the tensor of target
+labels and correctly matching them with the input tensors. To address this, I adopted an
+alternative approach, which, although requiring more storage and time, effectively
+solves the problem. This approach involves slicing the source files into smaller patches
+and saving them. Consequently, for each city, I generated several outputs: the JPEG of
+the entire city, JPEG files for each patch, the Sentinel file of the entire city, and Sentinel
+files for each patch. This method allowed proper alignment of the patches for the next
+training task.
+After creating the patches, I proceeded to create tensors for each JPEG and Sentinel
+patch file using the create_tensors_from_patches function. This function iterates
+through all the .nc and .jpg files, converting each patch into a NumPy array. These arrays
+are then appended and converted into tensors using TensorFlow's convert_to_tensor
+function. To ensure the tensors have the correct shape, the function is used as follows:
+input_tensor = tf.convert_to_tensor(np.transpose(np.array(sentinel_patches), (0, 2, 3,
+1)), dtype=tf.float32)
+target_tensor = tf.convert_to_tensor(np.array(jpeg_patches), dtype=tf.float32)
+Here, np.transpose is used to reorder the dimensions of the NumPy array containing
+Sentinel patches. The original array has dimensions [N, C, H, W]. By transposing the
+array to [N, H, W, C], it is matched to the required format of Tensorflow, where the
+channel dimension is placed last. I also tried keeping the original array but this has
+given me some mistakes and missalignement, especially when I tried to visualize it. For
+the target tensor, the convert_to_tensor function directly converts the NumPy array to a
+tensor with dimensions [N, H, W], as it does not include a channel dimension.
+When I initially loaded the JPEG patches as black and white images, a significant
+amount of building information was lost. To address this, I used all colors for reading the
+patches. However, this approach failed during model training because the model
+couldn't distinguish which pixels represented buildings. Therefore, I manually
+transformed the target tensors into binary masks, this allowed me to adjust the
+threshhold when a pixel value is classified as a building or not. After some adjustment I
+settled on a threshhold of 0.1. Increasing the threshhold will include more pixels as
+buildings, but this can also lead to classyfing to many pixels wrongfully as buildings.
+What the function exactly does it to create binary mask using the specified threshold.
+The tf.cast function is employed to convert the mask into a binary format, where pixels
+with values greater than the threshold are set to 1 (indicating buildings), and those with
+values below or equal to the threshold are set to 0 (indicating non-building areas).
+The final step involved addressing patches that, after transformation, were completely
+pitch black or white. To tackle this, I implemented a filter that removes masks with
+average values below 0.01 or above 0.99, ensuring only meaningful patches are retained
+for training.
+The dataset was then split to ensure proper training, validation, and testing. Berlin was
+designated as the test set, while the remaining cities were combined for training and
+validation. The train_test_split function from the sklearn library was used to divide the
+combined dataset, reserving 20% of the data for validation.
+1.3 Modeling and Tuning
+Using the TensorFlow Keras library, I developed the initial baseline model for building
+segmentation, leveraging four padded CNN layers. The first three layers utilized 3x3
+kernels with a single stride, increasing the number of channels from 32 to 64, and then
+to 128. The final layer used a 1x1 kernel to produce a single output channel indicating
+the presence of a building. After a bit of googling, I selected binary crossentropy as the
+loss function due to its popularity for CNN-based binary classification tasks.
+Next, I conducted hyperparameter tuning to optimize the model's performance. I
+created a function to build the model with adjustable L2 regularization and learning
+rates. I defined a grid of hyperparameters
+(l2_regs = [0.001, 0.01, 0.1] and learning_rates = [0.0001, 0.001, 0.01])
+and trained multiple models with different combinations of these parameters. The
+model training incorporated early stopping to avoid overfitting, and I evaluated each
+model's validation accuracy to identify the best-performing configuration.
+To further enhance the segmentation capabilities, I implemented a U-Net model, which
+is known for efficacy in image segmentation. The U-Net architecture included an
+encoder with convolutional and max-pooling layers to capture context, a bridge with a
+bottleneck layer, and a decoder with upsampling. This model was also trained with early
+stopping and evaluated on the test set.
+Results:
+In the normal training setup, the model achieved a test accuracy 0.6350135207176208,
+indicating moderate performance in distinguishing building pixels. When
+hyperparameter tuning was introduced, the best configuration (L2 regularization of 0.1
+and learning rate of 0.0001) improved the test accuracy to 0.6646453142166138,
+showing the importance of tuning to enhance model performance. The U-Net model,
+known for its effectiveness in segmentation tasks, was also evaluated and achieved a
+test accuracy of 0.6350135207176208. These results demonstrate that while the basic
+CNN architecture with hyperparameter tuning offers some improvements, advanced
+architectures like U-Net can provide comparable performance.
+Plots for normal model
+Plots for U-Net model
+1.4 Data Augmentation
+To enhance model quality, I employed data augmentation techniques such as shear,
+rotation, and reflection. Initially, I attempted to use the ImageDataGenerator from the
+TensorFlow Keras library. However, due to the shape of the target tensor, I always got
+errors because of invalid tensor shape. Consequently, I implemented a more sloppy
+solution by applying augmentations during the patch creation phase. The functon
+create_and_save_patches in the data_augmentation.ipynb file is very similar to the
+same function in the (…) function, with the addition that next to the normal patches the
+augmented patches are created and saved. Given the substantial number of patches, I
+limited the augmentations to shearing, rotation, and reflection to manage storage and
+computational constraints. The augmented data was used in the same machine
+learning pipeline as the original data, maintaining the same models.
+The results of the augmentation experiments were rather interesting and should be
+taken with a grain of salt due to my unorthodox implementation of data augmentation:
+all augments Test accuracy: 0.6174458265304565
+only reflection Test accuracy: 0.6350167393684387
+only Rotation Test accuracy: 0.5882859230041504
+only Shear Test accuracy: 0.6114670038223267
+normal Test accuracy: 0.6350135207176208
+normal + reflection Test accuracy: 0.6350151300430298
+These findings reveal that simply adding more data through augmentation does not
+automatically improve results. Reflection alone yielded the highest test accuracy,
+suggesting it increases the diversity of building orientations in the training data without
+altering the inherent structure too drastically. Conversely, rotation resulted in the lowest
+test accuracy, possibly due to introducing excessive variability that the model struggles
+to generalize.
+The combined augmentations did not outperform the individual augmentations,
+indicating potential redundancy or conflicting transformations when used together. This
+underscores the importance of carefully selecting augmentation techniques to enhance
+model performance.
